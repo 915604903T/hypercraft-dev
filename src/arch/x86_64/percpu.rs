@@ -3,6 +3,8 @@ use crate::{HyperResult, HyperError};
 use crate::arch::vmx::VmxPerCpuState;
 
 use super::VCpu;
+#[cfg(feature = "type1_5")]
+use super::vmx::LinuxContext;
 
 /// Host per-CPU states to run the guest. All methods must be called on the corresponding CPU.
 pub struct PerCpu<H: HyperCraftHal> {
@@ -36,7 +38,20 @@ impl<H: HyperCraftHal> PerCpu<H> {
             }
         }
     }
-
+    #[cfg(feature = "type1_5")]
+    /// Enable type 1.5 hardware virtualization on the current CPU.
+    pub fn hardware_enable_type1_5(&mut self, linux: &LinuxContext) -> HyperResult {
+        match self.arch.hardware_enable_type1_5(linux) {
+            Ok(_) => {
+                info!("VMX enabled on cpu {}.", self.cpu_id);
+                Ok(())
+            },
+            e @ Err(_) => {
+                e
+            }
+        }
+    }
+    
     /// Disable hardware virtualization on the current CPU.
     pub fn hardware_disable(&mut self) -> HyperResult {
         match self.arch.hardware_disable() {
@@ -50,18 +65,9 @@ impl<H: HyperCraftHal> PerCpu<H> {
         }
     }
 
-    /// Create a [`VCpu<H>`], set the entry point to `entry`, set the nested
-    /// page table root to `npt_root`.
-    pub fn create_vcpu(
-        &self,
-        entry: GuestPhysAddr,
-        npt_root: HostPhysAddr,
-    ) -> HyperResult<VCpu<H>> {
-        if !self.is_enabled() {
-            Err(HyperError::BadState)
-        } else {
-            VCpu::new(&self.arch, entry, npt_root)
-        }
+    /// Get current vmcs revision id.
+    pub fn vmcs_revision_id(&self) -> u32 {
+        self.arch.vmcs_revision_id()
     }
 }
 

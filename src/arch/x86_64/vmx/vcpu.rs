@@ -1,12 +1,15 @@
 use alloc::collections::VecDeque;
+use x86_64::registers::debug;
 use core::fmt::{Debug, Formatter, Result};
 use core::{arch::asm, mem::size_of};
 
 use bit_field::BitField;
 use x86::bits64::vmx;
+use x86::controlregs::{ Xcr0, xcr0 as xcr0_read, xcr0_write };
 use x86::dtables::{self, DescriptorTablePointer};
 use x86::segmentation::SegmentSelector;
 use x86_64::registers::control::{Cr0, Cr0Flags, Cr3, Cr4, Cr4Flags};
+use raw_cpuid::CpuId;
 
 use super::region::{MsrBitmap, VmxRegion};
 use super::vmcs::{
@@ -16,33 +19,66 @@ use super::vmcs::{
 use super::VmxPerCpuState;
 use super::definitions::VmxExitReason;
 use crate::arch::{msr::Msr, memory::NestedPageFaultInfo, regs::GeneralRegisters};
-use crate::arch::lapic::ApicTimer;
-use crate::{GuestPhysAddr, HostPhysAddr, HyperCraftHal, HyperResult};
+use crate::{GuestPhysAddr, HostPhysAddr, HyperCraftHal, HyperResult, HyperError, VmxExitInfo};
+#[cfg(feature = "type1_5")]
+use super::LinuxContext;
+#[cfg(feature = "type1_5")]
+use super::segmentation::Segment;
+
+pub struct XState {
+    host_xcr0: u64,
+    guest_xcr0: u64,
+    host_xss: u64,
+    guest_xss: u64,
+}
+
+impl XState {
+    /// Create a new [`XState`] instance with current host state
+    fn new() -> Self {
+        let xcr0 = unsafe { xcr0_read().bits() };
+        let xss = Msr::IA32_XSS.read();
+
+        Self { host_xcr0: xcr0, guest_xcr0: xcr0, host_xss: xss, guest_xss: xss }
+    }
+
+    fn enable_xsave() {
+        unsafe { Cr4::write(Cr4::read() | Cr4Flags::OSXSAVE) };
+    }
+}
 
 /// A virtual CPU within a guest.
 #[repr(C)]
 pub struct VmxVcpu<H: HyperCraftHal> {
+    // DO NOT modify `guest_regs` and `host_stack_top` and their order unless you do know what you are doing!
+    // DO NOT add anything before or between them unless you do know what you are doing!
     guest_regs: GeneralRegisters,
     host_stack_top: u64,
+    vcpu_id: usize,
+    launched: bool,
     vmcs: VmxRegion<H>,
     msr_bitmap: MsrBitmap<H>,
-    apic_timer: ApicTimer<H>,
     pending_events: VecDeque<(u8, Option<u32>)>,
+    xstate: XState,
 }
 
 impl<H: HyperCraftHal> VmxVcpu<H> {
-    pub(crate) fn new(
-        percpu: &VmxPerCpuState<H>,
+    /// Create a new [`VmxVcpu`].
+    pub fn new(
+        vcpu_id: usize,
+        vmcs_revision_id: u32,
         entry: GuestPhysAddr,
         ept_root: HostPhysAddr,
     ) -> HyperResult<Self> {
+        XState::enable_xsave();
         let mut vcpu = Self {
             guest_regs: GeneralRegisters::default(),
             host_stack_top: 0,
-            vmcs: VmxRegion::new(percpu.vmcs_revision_id, false)?,
+            vcpu_id,
+            launched: false,
+            vmcs: VmxRegion::new(vmcs_revision_id, false)?,
             msr_bitmap: MsrBitmap::passthrough_all()?,
-            apic_timer: ApicTimer::new(),
             pending_events: VecDeque::with_capacity(8),
+            xstate: XState::new(),
         };
         vcpu.setup_msr_bitmap()?;
         vcpu.setup_vmcs(entry, ept_root)?;
@@ -50,12 +86,63 @@ impl<H: HyperCraftHal> VmxVcpu<H> {
         Ok(vcpu)
     }
 
-    /// Run the guest, never return.
-    pub fn run(&mut self) -> ! {
-        VmcsHostNW::RSP
-            .write(&self.host_stack_top as *const _ as usize)
-            .unwrap();
-        unsafe { self.vmx_launch() }
+    /// Get the identifier of this [`VmxVcpu`].
+    pub fn vcpu_id(&self) -> usize {
+        self.vcpu_id
+    }
+
+    /// Bind this [`VmxVcpu`] to current logical processor.
+    pub fn bind_to_current_processor(&self) -> HyperResult {
+        unsafe { vmx::vmptrld(self.vmcs.phys_addr() as u64)?; }
+        Ok(())
+    }
+
+    /// Unbind this [`VmxVcpu`] from current logical processor.
+    pub fn unbind_from_current_processor(&self) -> HyperResult {
+        unsafe { vmx::vmclear(self.vmcs.phys_addr() as u64)?;  }
+        Ok(())
+    }
+
+    /// Run the guest. It returns when a vm-exit happens and returns the vm-exit if it cannot be handled by this [`VmxVcpu`] itself.
+    pub fn run(&mut self) -> Option<VmxExitInfo> {
+        // Inject pending events
+        if self.launched {
+            self.inject_pending_events().unwrap();
+        }
+        
+        // Run guest
+        self.load_guest_xstate();
+        unsafe { 
+            if self.launched {
+                self.vmx_resume();
+            } else {
+                self.launched = true;
+                VmcsHostNW::RSP.write(&self.host_stack_top as *const _ as usize).unwrap();
+
+                self.vmx_launch();
+            }
+        }
+        self.load_host_xstate();
+
+        // Handle vm-exits
+        let exit_info = self.exit_info().unwrap();
+        trace!("VM exit: {:#x?}", exit_info);    
+
+        let cr4 = VmcsGuestNW::CR4.read().unwrap();
+        if cr4.get_bit(18) {
+            // panic!("osxsave dead!");
+        }
+
+        match self.builtin_vmexit_handler(&exit_info) {
+            Some(result) => {   
+                if result.is_err() {
+                    panic!("VmxVcpu failed to handle a VM-exit that should be handled by itself: {:?}, error {:?}, vcpu: {:#x?}", exit_info.exit_reason, result.unwrap_err(), self);
+                }
+
+                None
+            },
+            None => Some(exit_info),
+        }
     }
 
     /// Basic information about VM exits.
@@ -98,6 +185,16 @@ impl<H: HyperCraftHal> VmxVcpu<H> {
         VmcsGuestNW::RSP.write(rsp).unwrap()
     }
 
+    /// Guest rip. (`RIP`)
+    pub fn rip(&self) -> usize {
+        VmcsGuestNW::RIP.read().unwrap()
+    }
+
+    /// Guest cs. (`cs`)
+    pub fn cs(&self) -> u16 {
+        VmcsGuest16::CS_SELECTOR.read().unwrap()
+    }
+
     /// Advance guest `RIP` by `instr_len` bytes.
     pub fn advance_rip(&mut self, instr_len: u8) -> HyperResult {
         Ok(VmcsGuestNW::RIP.write(VmcsGuestNW::RIP.read()? + instr_len as usize)?)
@@ -105,7 +202,7 @@ impl<H: HyperCraftHal> VmxVcpu<H> {
 
     /// Add a virtual interrupt or exception to the pending events list,
     /// and try to inject it before later VM entries.
-    pub fn inject_event(&mut self, vector: u8, err_code: Option<u32>) {
+    pub fn queue_event(&mut self, vector: u8, err_code: Option<u32>) {
         self.pending_events.push_back((vector, err_code));
     }
 
@@ -122,11 +219,6 @@ impl<H: HyperCraftHal> VmxVcpu<H> {
         }
         VmcsControl32::PRIMARY_PROCBASED_EXEC_CONTROLS.write(ctrl)?;
         Ok(())
-    }
-
-    /// Returns the mutable reference of [`ApicTimer`].
-    pub fn apic_timer_mut(&mut self) -> &mut ApicTimer<H> {
-        &mut self.apic_timer
     }
 }
 
@@ -149,11 +241,12 @@ impl<H: HyperCraftHal> VmxVcpu<H> {
         let paddr = self.vmcs.phys_addr() as u64;
         unsafe {
             vmx::vmclear(paddr)?;
-            vmx::vmptrld(paddr)?;
         }
+        self.bind_to_current_processor()?;
         self.setup_vmcs_host()?;
         self.setup_vmcs_guest(entry)?;
         self.setup_vmcs_control(ept_root)?;
+        self.unbind_from_current_processor()?;
         Ok(())
     }
 
@@ -196,7 +289,7 @@ impl<H: HyperCraftHal> VmxVcpu<H> {
     fn setup_vmcs_guest(&mut self, entry: GuestPhysAddr) -> HyperResult {
         let cr0_guest = Cr0Flags::EXTENSION_TYPE | Cr0Flags::NUMERIC_ERROR;
         let cr0_host_owned =
-            Cr0Flags::NUMERIC_ERROR | Cr0Flags::NOT_WRITE_THROUGH | Cr0Flags::CACHE_DISABLE;
+            Cr0Flags::NUMERIC_ERROR; // | Cr0Flags::NOT_WRITE_THROUGH | Cr0Flags::CACHE_DISABLE;
         let cr0_read_shadow = Cr0Flags::NUMERIC_ERROR;
         VmcsGuestNW::CR0.write(cr0_guest.bits() as _)?;
         VmcsControlNW::CR0_GUEST_HOST_MASK.write(cr0_host_owned.bits() as _)?;
@@ -277,7 +370,7 @@ impl<H: HyperCraftHal> VmxVcpu<H> {
             Msr::IA32_VMX_PROCBASED_CTLS.read() as u32,
             (CpuCtrl::UNCOND_IO_EXITING | CpuCtrl::USE_MSR_BITMAPS | CpuCtrl::SECONDARY_CONTROLS)
                 .bits(),
-            (CpuCtrl::CR3_LOAD_EXITING | CpuCtrl::CR3_STORE_EXITING).bits(),
+            (CpuCtrl::CR3_LOAD_EXITING | CpuCtrl::CR3_STORE_EXITING | CpuCtrl::CR8_LOAD_EXITING | CpuCtrl::CR8_STORE_EXITING).bits(),
         )?;
 
         // Enable EPT, RDTSCP, INVPCID, and unrestricted guest.
@@ -289,7 +382,8 @@ impl<H: HyperCraftHal> VmxVcpu<H> {
             (CpuCtrl2::ENABLE_EPT
                 | CpuCtrl2::ENABLE_RDTSCP
                 | CpuCtrl2::ENABLE_INVPCID
-                | CpuCtrl2::UNRESTRICTED_GUEST)
+                | CpuCtrl2::UNRESTRICTED_GUEST
+                | CpuCtrl2::ENABLE_XSAVES_XRSTORS)
                 .bits(),
             0,
         )?;
@@ -327,43 +421,463 @@ impl<H: HyperCraftHal> VmxVcpu<H> {
         VmcsControl32::VMEXIT_MSR_LOAD_COUNT.write(0)?;
         VmcsControl32::VMENTRY_MSR_LOAD_COUNT.write(0)?;
 
-        // Pass-through exceptions, don't use I/O bitmap, set MSR bitmaps.
-        VmcsControl32::EXCEPTION_BITMAP.write(0)?;
+        // Pass-through exceptions (except #UD(6)), don't use I/O bitmap, set MSR bitmaps.
+        let exception_bitmap: u32 = 1 << 6;
+
+        VmcsControl32::EXCEPTION_BITMAP.write(exception_bitmap)?;
         VmcsControl64::IO_BITMAP_A_ADDR.write(0)?;
         VmcsControl64::IO_BITMAP_B_ADDR.write(0)?;
         VmcsControl64::MSR_BITMAPS_ADDR.write(self.msr_bitmap.phys_addr() as _)?;
         Ok(())
     }
 
-    #[naked]
-    unsafe extern "C" fn vmx_launch(&mut self) -> ! {
+}
+
+// Implementaton for type1.5 hypervisor
+#[cfg(feature = "type1_5")]
+impl <H: HyperCraftHal> VmxVcpu<H> {
+    /// Create a new [`VmxVcpu`] for type1.5 hypervisor
+    pub fn new_type15(
+        vcpu_id: usize,
+        vmcs_revision_id: u32,
+        ept_root: HostPhysAddr,
+        linux: &LinuxContext,
+    ) -> HyperResult<Self> {
+        XState::enable_xsave();
+        // unsafe { Cr4::write(Cr4::read() & !(Cr4Flags::OSXSAVE)) };
+        let mut vcpu = Self {
+            guest_regs: GeneralRegisters::default(),
+            host_stack_top: 0,
+            vcpu_id,
+            launched: false,
+            vmcs: VmxRegion::new(vmcs_revision_id, false)?,
+            msr_bitmap: MsrBitmap::passthrough_all()?,
+            pending_events: VecDeque::with_capacity(8),
+            xstate: XState::new(),
+        };
+        // vcpu.setup_type15_msr_bitmap()?;
+        vcpu.setup_type15_vmcs(ept_root, linux)?;
+        let regs = vcpu.regs_mut();
+        regs.rax = 0;
+        regs.rbx = linux.rbx;
+        regs.rbp = linux.rbp;
+        regs.r12 = linux.r12;
+        regs.r13 = linux.r13;
+        regs.r14 = linux.r14;
+        regs.r15 = linux.r15;
+
+        info!("[HV] created VmxVcpu(vmcs: {:#x})", vcpu.vmcs.phys_addr());
+        Ok(vcpu)
+    }
+
+    /// Run the guest. It returns when a vm-exit happens and returns the vm-exit if it cannot be handled by this [`VmxVcpu`] itself.
+    pub fn run_type15(&mut self, _linux: &LinuxContext) -> Option<VmxExitInfo> {
+        // Inject pending events
+        if self.launched {
+            self.inject_pending_events().unwrap();
+        }
+        
+        // Run guest
+        self.load_guest_xstate();
+        // debug!("vcpu set to linux regs: {:#x?}", self.guest_regs);
+        unsafe { 
+            if self.launched {
+                // debug!("before resume");
+                self.vmx_resume();
+            } else {
+                self.launched = true;
+                VmcsHostNW::RSP.write(&self.host_stack_top as *const _ as usize).unwrap();
+                debug!("vcpu{} before vmlaunch", self.vcpu_id);
+                self.vmx_launch();
+            }
+        }
+        self.load_host_xstate();
+
+        // Handle vm-exits
+        let exit_info = self.exit_info().unwrap();
+        trace!("VM exit: {:#x?}", exit_info);   
+        // debug!("VM exit: {:#x?}", exit_info);  
+
+        let cr4 = VmcsGuestNW::CR4.read().unwrap();
+        if cr4.get_bit(18) {
+            // debug!("get cr4 osxsave bit");
+            // panic!("osxsave dead!");
+        }
+        match self.builtin_vmexit_handler(&exit_info) {
+            Some(result) => {   
+                if result.is_err() {
+                    panic!("VmxVcpu failed to handle a VM-exit that should be handled by itself: {:?}, error {:?}, vcpu: {:#x?}", exit_info.exit_reason, result.unwrap_err(), self);
+                }
+
+                None
+            },
+            None => Some(exit_info),
+        }
+    }
+
+    fn setup_type15_msr_bitmap(&mut self) -> HyperResult {
+        // read
+        self.msr_bitmap.set_read_intercept(0x277, true); // IA32_PAT
+        self.msr_bitmap.set_read_intercept(0x2FF, true); // IA32_MTRR_DEF_TYPE
+
+        self.msr_bitmap.set_read_intercept(0x802, true); // IA32_X2APIC_APICID
+        self.msr_bitmap.set_read_intercept(0x803, true); // IA32_X2APIC_VERSION
+        self.msr_bitmap.set_read_intercept(0x808, true); // IA32_X2APIC_TPR
+        self.msr_bitmap.set_read_intercept(0x80A, true); // IA32_X2APIC_PPR
+        self.msr_bitmap.set_read_intercept(0x80D, true); // IA32_X2APIC_LDR
+        self.msr_bitmap.set_read_intercept(0x80F, true); // IA32_X2APIC_SIVR
+        // IA32_X2APIC_ISR0..IA32_X2APIC_ISR7
+        for msr in 0x810..=0x817 {
+            self.msr_bitmap.set_read_intercept(msr, true);
+        }
+        // IA32_X2APIC_TMR0..IA32_X2APIC_TMR7
+        for msr in 0x818..=0x81F {
+            self.msr_bitmap.set_read_intercept(msr, true);
+        }
+        // IA32_X2APIC_IRR0..IA32_X2APIC_IRR7
+        for msr in 0x820..=0x827 {
+            self.msr_bitmap.set_read_intercept(msr, true);
+        }
+        self.msr_bitmap.set_read_intercept(0x828, true); // IA32_X2APIC_ESR
+        self.msr_bitmap.set_read_intercept(0x82F, true); // IA32_X2APIC_LVT_CMCI
+        self.msr_bitmap.set_read_intercept(0x830, true); // IA32_X2APIC_ICR
+        // IA32_X2APIC_LVT_*
+        for msr in 0x832..=0x837 {
+            self.msr_bitmap.set_read_intercept(msr, true);
+        }
+        self.msr_bitmap.set_read_intercept(0x838, true); // IA32_X2APIC_INIT_COUNT
+        self.msr_bitmap.set_read_intercept(0x839, true); // IA32_X2APIC_CUR_COUNT
+        self.msr_bitmap.set_read_intercept(0x83E, true); // IA32_X2APIC_DIV_CONF
+
+        // write
+        self.msr_bitmap.set_write_intercept(0x1B, true); // IA32_APIC_BASE
+
+        // IA32_MTRR_*
+        for msr in 0x200..=0x277 {
+            self.msr_bitmap.set_write_intercept(msr, true);
+        }
+        self.msr_bitmap.set_write_intercept(0x277, true); // IA32_PAT
+        self.msr_bitmap.set_write_intercept(0x2FF, true); // IA32_MTRR_DEF_TYPE
+        self.msr_bitmap.set_write_intercept(0x38F, true); // IA32_PERF_GLOBAL_CTRL
+        for msr in 0xC80..=0xD8F{
+            self.msr_bitmap.set_write_intercept(msr, true);
+        }
+
+        self.msr_bitmap.set_write_intercept(0x808, true); // IA32_X2APIC_TPR
+        self.msr_bitmap.set_write_intercept(0x80B, true); // IA32_X2APIC_EOI
+        self.msr_bitmap.set_write_intercept(0x80F, true); // IA32_X2APIC_SIVR
+        self.msr_bitmap.set_write_intercept(0x828, true); // IA32_X2APIC_ESR
+        self.msr_bitmap.set_write_intercept(0x82F, true); // IA32_X2APIC_LVT_CMCI
+        self.msr_bitmap.set_write_intercept(0x830, true); // IA32_X2APIC_ICR
+        // IA32_X2APIC_LVT_*
+        for msr in 0x832..=0x837{
+            self.msr_bitmap.set_write_intercept(msr, true);
+        }
+        self.msr_bitmap.set_write_intercept(0x838, true); // IA32_X2APIC_INIT_COUNT
+        self.msr_bitmap.set_write_intercept(0x839, true); // IA32_X2APIC_CUR_COUNT
+        self.msr_bitmap.set_write_intercept(0x83E, true); // IA32_X2APIC_DIV_CONF
+
+        Ok(())
+    }
+
+    fn setup_type15_vmcs(&mut self, ept_root: HostPhysAddr, linux: &LinuxContext) -> HyperResult {
+        let paddr = self.vmcs.phys_addr() as u64;
+        unsafe {
+            vmx::vmclear(paddr)?;
+        }
+        self.bind_to_current_processor()?;
+        self.setup_type15_vmcs_host()?;
+        self.setup_type15_vmcs_guest(linux)?;
+        self.setup_type15_vmcs_control(ept_root)?;
+        self.unbind_from_current_processor()?;
+        Ok(())
+    }
+
+    fn setup_type15_vmcs_host(&mut self) -> HyperResult {
+        use x86::Ring;
+        VmcsHost64::IA32_PAT.write(Msr::IA32_PAT.read())?;
+        VmcsHost64::IA32_EFER.write(Msr::IA32_EFER.read())?;
+        
+        VmcsHostNW::CR0.write(Cr0::read_raw() as _)?;
+        VmcsHostNW::CR3.write(Cr3::read_raw().0.start_address().as_u64() as _)?;
+        VmcsHostNW::CR4.write(Cr4::read_raw() as _)?;
+        
+        VmcsHost16::ES_SELECTOR.write(0)?;
+        VmcsHost16::CS_SELECTOR.write(SegmentSelector::new(2, Ring::Ring0).bits())?;
+        VmcsHost16::SS_SELECTOR.write(0)?;
+        VmcsHost16::DS_SELECTOR.write(0)?;
+        VmcsHost16::FS_SELECTOR.write(0)?;
+        VmcsHost16::GS_SELECTOR.write(0)?;
+        VmcsHost16::TR_SELECTOR.write(SegmentSelector::new(7, Ring::Ring0).bits())?;
+        VmcsHostNW::FS_BASE.write(0)?;
+        VmcsHostNW::GS_BASE.write(Msr::IA32_GS_BASE.read() as _)?;
+        VmcsHostNW::TR_BASE.write(0)?;
+        
+        let mut gdtp = DescriptorTablePointer::<u64>::default();
+        let mut idtp = DescriptorTablePointer::<u64>::default();
+        unsafe {
+            dtables::sgdt(&mut gdtp);
+            dtables::sidt(&mut idtp);
+        }        
+        VmcsHostNW::GDTR_BASE.write(gdtp.base as _)?;
+        VmcsHostNW::IDTR_BASE.write(idtp.base as _)?;
+        
+        VmcsHostNW::IA32_SYSENTER_ESP.write(0)?;
+        VmcsHostNW::IA32_SYSENTER_EIP.write(0)?;
+        VmcsHost32::IA32_SYSENTER_CS.write(0)?;
+        
+        // TODO: RSP
+        VmcsHostNW::RIP.write(Self::vmx_exit as usize)?;
+
+        Ok(())
+    }
+
+    fn setup_type15_vmcs_guest(&mut self, linux: &LinuxContext) -> HyperResult {
+        VmcsGuest64::IA32_PAT.write(linux.pat)?;
+        VmcsGuest64::IA32_EFER.write(linux.efer)?;
+
+        self.set_cr(0, linux.cr0.bits());
+        self.set_cr(4, linux.cr4.bits());
+        self.set_cr(3, linux.cr3);
+
+        macro_rules! set_guest_segment {
+            ($seg: expr, $reg: ident) => {{
+                use VmcsGuest16::*;
+                use VmcsGuest32::*;
+                use VmcsGuestNW::*;
+                concat_idents!($reg, _SELECTOR).write($seg.selector.bits())?;
+                concat_idents!($reg, _BASE).write($seg.base as _)?;
+                concat_idents!($reg, _LIMIT).write($seg.limit)?;
+                concat_idents!($reg, _ACCESS_RIGHTS).write($seg.access_rights.bits())?;
+            }};
+        }
+        set_guest_segment!(linux.es, ES);
+        set_guest_segment!(linux.cs, CS);
+        set_guest_segment!(linux.ss, SS);
+        set_guest_segment!(linux.ds, DS);
+        set_guest_segment!(linux.fs, FS);
+        set_guest_segment!(linux.gs, GS);
+        set_guest_segment!(linux.tss, TR);
+        set_guest_segment!(Segment::invalid(), LDTR);
+
+        VmcsGuestNW::GDTR_BASE.write(linux.gdt.base as _)?;
+        VmcsGuest32::GDTR_LIMIT.write(linux.gdt.limit as _)?;
+        VmcsGuestNW::IDTR_BASE.write(linux.idt.base as _)?;
+        VmcsGuest32::IDTR_LIMIT.write(linux.idt.limit as _)?;
+
+        debug!("this is the linux rip: {:#x} rsp:{:#x}", linux.rip, linux.rsp);
+        VmcsGuestNW::RSP.write(linux.rsp as _)?;
+        VmcsGuestNW::RIP.write(linux.rip as _)?;
+        VmcsGuestNW::RFLAGS.write(0x2)?;
+
+        VmcsGuest32::IA32_SYSENTER_CS.write(Msr::IA32_SYSENTER_CS.read() as _)?;
+        VmcsGuestNW::IA32_SYSENTER_ESP.write(Msr::IA32_SYSENTER_ESP.read() as _)?;
+        VmcsGuestNW::IA32_SYSENTER_EIP.write(Msr::IA32_SYSENTER_EIP.read() as _)?;
+
+        VmcsGuestNW::DR7.write(0x400)?;
+        VmcsGuest64::IA32_DEBUGCTL.write(0)?;
+
+        VmcsGuest32::ACTIVITY_STATE.write(0)?;
+        VmcsGuest32::INTERRUPTIBILITY_STATE.write(0)?;
+        VmcsGuestNW::PENDING_DBG_EXCEPTIONS.write(0)?;
+
+        VmcsGuest64::LINK_PTR.write(u64::MAX)?;
+        VmcsGuest32::VMX_PREEMPTION_TIMER_VALUE.write(0)?;
+        Ok(())
+    }
+
+    fn setup_type15_vmcs_control(&mut self, ept_root: HostPhysAddr) -> HyperResult {
+        use super::vmcs::controls::*;
+        use PinbasedControls as PinCtrl;
+        vmcs::set_control_type15(
+            VmcsControl32::PINBASED_EXEC_CONTROLS,
+            Msr::IA32_VMX_PINBASED_CTLS.read(),
+            // NO INTR_EXITING to pass-through interrupts
+            PinCtrl::NMI_EXITING.bits(),
+            0,
+        )?;
+
+        // Intercept all I/O instructions, use MSR bitmaps, activate secondary controls,
+        // disable CR3 load/store interception.
+        use PrimaryControls as CpuCtrl;
+        vmcs::set_control_type15(
+            VmcsControl32::PRIMARY_PROCBASED_EXEC_CONTROLS,
+            Msr::IA32_VMX_PROCBASED_CTLS.read(),
+            // NO UNCOND_IO_EXITING to pass-through PIO
+            (CpuCtrl::USE_MSR_BITMAPS | CpuCtrl::SECONDARY_CONTROLS).bits(),
+            (CpuCtrl::CR3_LOAD_EXITING | CpuCtrl::CR3_STORE_EXITING).bits(),
+        )?;
+
+        // Enable EPT, RDTSCP, INVPCID, and unrestricted guest.
+        use SecondaryControls as CpuCtrl2;
+        let mut val = CpuCtrl2::ENABLE_EPT | CpuCtrl2::UNRESTRICTED_GUEST;
+        if let Some(features) = CpuId::new().get_extended_processor_and_feature_identifiers() {
+            if features.has_rdtscp() {
+                val |= CpuCtrl2::ENABLE_RDTSCP;
+            }
+        } 
+        if let Some(features) = CpuId::new().get_extended_feature_info() {
+            if features.has_invpcid() {
+                val |= CpuCtrl2::ENABLE_INVPCID;
+            }
+        } 
+        if let Some(features) = CpuId::new().get_extended_state_info() {
+            if features.has_xsaves_xrstors() {
+                val |= CpuCtrl2::ENABLE_XSAVES_XRSTORS;
+            }
+        } 
+        vmcs::set_control_type15(
+            VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS,
+            Msr::IA32_VMX_PROCBASED_CTLS2.read(),
+            val.bits(),
+            0,
+        )?;
+
+        // Switch to 64-bit host, acknowledge interrupt info, switch IA32_PAT/IA32_EFER on VM exit.
+        use ExitControls as ExitCtrl;
+        vmcs::set_control_type15(
+            VmcsControl32::VMEXIT_CONTROLS,
+            Msr::IA32_VMX_EXIT_CTLS.read(),
+            (ExitCtrl::HOST_ADDRESS_SPACE_SIZE
+                | ExitCtrl::SAVE_IA32_PAT
+                | ExitCtrl::LOAD_IA32_PAT
+                | ExitCtrl::SAVE_IA32_EFER
+                | ExitCtrl::LOAD_IA32_EFER)
+                .bits(),
+            0,
+        )?;
+
+        // Load guest IA32_PAT/IA32_EFER on VM entry.
+        use EntryControls as EntryCtrl;
+        vmcs::set_control_type15(
+            VmcsControl32::VMENTRY_CONTROLS,
+            Msr::IA32_VMX_ENTRY_CTLS.read(),
+            (EntryCtrl::IA32E_MODE_GUEST | EntryCtrl::LOAD_IA32_PAT | EntryCtrl::LOAD_IA32_EFER).bits(),
+            0,
+        )?;
+
+        // No MSR switches if hypervisor doesn't use and there is only one vCPU.
+        VmcsControl32::VMEXIT_MSR_STORE_COUNT.write(0)?;
+        VmcsControl32::VMEXIT_MSR_LOAD_COUNT.write(0)?;
+        VmcsControl32::VMENTRY_MSR_LOAD_COUNT.write(0)?;
+
+        VmcsControlNW::CR4_GUEST_HOST_MASK.write(0)?;  
+        VmcsControl32::CR3_TARGET_COUNT.write(0)?;
+
+        vmcs::set_ept_pointer(ept_root)?;
+
+        // Pass-through exceptions (except #UD(6)), don't use I/O bitmap, set MSR bitmaps.
+        let exception_bitmap: u32 = 1 << 6;
+
+        VmcsControl32::EXCEPTION_BITMAP.write(exception_bitmap)?;
+        VmcsControl64::MSR_BITMAPS_ADDR.write(self.msr_bitmap.phys_addr() as _)?;
+        Ok(())
+    }
+
+    fn set_cr(&mut self, cr_idx: usize, val: u64) {
+        (|| -> HyperResult {
+            match cr_idx {
+                0 => {
+                    // Retrieve/validate restrictions on CR0
+                    //
+                    // In addition to what the VMX MSRs tell us, make sure that
+                    // - NW and CD are kept off as they are not updated on VM exit and we
+                    //   don't want them enabled for performance reasons while in root mode
+                    // - PE and PG can be freely chosen (by the guest) because we demand
+                    //   unrestricted guest mode support anyway
+                    // - ET is ignored
+                    let must0 = Msr::IA32_VMX_CR0_FIXED1.read()
+                        & !(Cr0Flags::NOT_WRITE_THROUGH | Cr0Flags::CACHE_DISABLE).bits();
+                    let must1 = Msr::IA32_VMX_CR0_FIXED0.read()
+                        & !(Cr0Flags::PAGING | Cr0Flags::PROTECTED_MODE_ENABLE).bits();
+                    VmcsGuestNW::CR0.write(((val & must0) | must1) as _)?;
+                    VmcsControlNW::CR0_READ_SHADOW.write(val as _)?;
+                    VmcsControlNW::CR0_GUEST_HOST_MASK.write((must1 | !must0) as _)?;
+                }
+                3 => VmcsGuestNW::CR3.write(val as _)?,
+                4 => {
+                    // Retrieve/validate restrictions on CR4
+                    let must0 = Msr::IA32_VMX_CR4_FIXED1.read();
+                    let must1 = Msr::IA32_VMX_CR4_FIXED0.read();
+                    let val = val | Cr4Flags::VIRTUAL_MACHINE_EXTENSIONS.bits();
+                    VmcsGuestNW::CR4.write(((val & must0) | must1) as _)?;
+                    VmcsControlNW::CR4_READ_SHADOW.write(val as _)?;
+                    VmcsControlNW::CR4_GUEST_HOST_MASK.write((must1 | !must0) as _)?;
+                }
+                _ => unreachable!(),
+            };
+            Ok(())
+        })()
+        .expect("Failed to write guest control register")
+    }
+
+    fn cr(&self, cr_idx: usize) -> usize {
+        (|| -> HyperResult<usize> {
+            Ok(match cr_idx {
+                0 => VmcsGuestNW::CR0.read()?,
+                3 => VmcsGuestNW::CR3.read()?,
+                4 => {
+                    let host_mask = VmcsControlNW::CR4_GUEST_HOST_MASK.read()?;
+                    (VmcsControlNW::CR4_READ_SHADOW.read()? & host_mask)
+                        | (VmcsGuestNW::CR4.read()? & !host_mask)
+                }
+                _ => unreachable!(),
+            })
+        })()
+        .expect("Failed to read guest control register")
+    }
+}
+
+/// Get ready then vmlaunch or vmresume.
+macro_rules! vmx_entry_with {
+    ($instr:literal) => {
         asm!(
+            save_regs_to_stack!(),                  // save host status
             "mov    [rdi + {host_stack_top}], rsp", // save current RSP to Vcpu::host_stack_top
             "mov    rsp, rdi",                      // set RSP to guest regs area
-            restore_regs_from_stack!(),
-            "vmlaunch",
+            restore_regs_from_stack!(),             // restore guest status
+            $instr,                                 // let's go!
             "jmp    {failed}",
             host_stack_top = const size_of::<GeneralRegisters>(),
             failed = sym Self::vmx_entry_failed,
             options(noreturn),
         )
     }
+}
+
+impl<H: HyperCraftHal> VmxVcpu<H> {
+    
+    #[naked]
+    /// Enter guest with vmlaunch.
+    /// 
+    /// `#[naked]` is essential here, without it the rust compiler will think `&mut self` is not used and won't give us correct %rdi.
+    /// 
+    /// This function itself never returns, but [`Self::vmx_exit`] will do the return for this.
+    /// 
+    /// The return value is a dummy value.
+    unsafe extern "C" fn vmx_launch(&mut self) -> usize {
+        vmx_entry_with!("vmlaunch")
+    }
 
     #[naked]
-    unsafe extern "C" fn vmx_exit(&mut self) -> ! {
+    /// Enter guest with vmresume.
+    /// 
+    /// See [`Self::vmx_launch`] for detail.
+    unsafe extern "C" fn vmx_resume(&mut self) -> usize {
+        vmx_entry_with!("vmresume")
+    }
+
+    #[naked]
+    /// Return after vm-exit.
+    /// 
+    /// The return value is a dummy value.
+    unsafe extern "C" fn vmx_exit(&mut self) -> usize {
         asm!(
-            save_regs_to_stack!(),
-            "mov    r15, rsp",                      // save temporary RSP to r15
-            "mov    rdi, rsp",                      // set the first arg to &Vcpu
+            save_regs_to_stack!(),                  // save guest status
             "mov    rsp, [rsp + {host_stack_top}]", // set RSP to Vcpu::host_stack_top
-            "call   {vmexit_handler}",              // call vmexit_handler
-            "mov    rsp, r15",                      // load temporary RSP from r15
-            restore_regs_from_stack!(),
-            "vmresume",
-            "jmp    {failed}",
+            restore_regs_from_stack!(),             // restore host status
+            "ret",
             host_stack_top = const size_of::<GeneralRegisters>(),
-            vmexit_handler = sym Self::vmexit_handler,
-            failed = sym Self::vmx_entry_failed,
             options(noreturn),
         );
     }
@@ -381,7 +895,7 @@ impl<H: HyperCraftHal> VmxVcpu<H> {
     }
 
     /// Try to inject a pending event before next VM entry.
-    fn check_pending_events(&mut self) -> HyperResult {
+    fn inject_pending_events(&mut self) -> HyperResult {
         if let Some(event) = self.pending_events.front() {
             if event.0 < 32 || self.allow_interrupt() {
                 // if it's an exception, or an interrupt that is not blocked, inject it directly.
@@ -395,36 +909,215 @@ impl<H: HyperCraftHal> VmxVcpu<H> {
         Ok(())
     }
 
-    fn vmexit_handler(&mut self) {
-        let exit_info = self.exit_info().unwrap();
-
+    /// Handle vm-exits than can and should be handled by [`VmxVcpu`] itself.
+    /// 
+    /// Return the result or None if the vm-exit was not handled.
+    fn builtin_vmexit_handler(&mut self, exit_info: &VmxExitInfo) -> Option<HyperResult> {
         if exit_info.entry_failure {
             panic!("VM entry failed: {:#x?}", exit_info);
         }
 
-        trace!("VM exit: {:#x?}", exit_info);
+        // Following vm-exits are handled here:
+        // - interrupt window: turn off interrupt window;
+        // - xsetbv: set guest xcr;
+        // - cr access: just panic;
+        match exit_info.exit_reason {
+            VmxExitReason::INTERRUPT_WINDOW => Some(self.set_interrupt_window(false)),
+            VmxExitReason::XSETBV => Some(self.handle_xsetbv()),
+            VmxExitReason::CR_ACCESS => panic!("Guest's access to cr not allowed: {:#x?}, {:#x?}", self, vmcs::cr_access_info()),
+            VmxExitReason::EXCEPTION_NMI => {
+                let int_info = self.interrupt_exit_info().unwrap();
+                info!("hello nmi!! need to do more things...");
+                debug!("exit_info: {:#x?}\nexception: {:#x?}\nvcpu: {:#x?}", exit_info, int_info, self);
+                // self.queue_event(int_info.vector, None);
 
-        // Handle some vmexits concerning apic timer and events here.
-        // Theoretically the best practice is enabling users to inject
-        // anything they want (including apic timers) to vcpus and let
-        // them handle all vmexits, but it's not very pragmatic now.
-        let result: HyperResult = match exit_info.exit_reason {
-            VmxExitReason::INTERRUPT_WINDOW => self.set_interrupt_window(false),
-            _ => H::vmexit_handler(self),
+                // debug!("CR4.OSXSAVE: {}", VmcsGuestNW::CR4.read().unwrap().get_bit(18));
+                
+                // use raw_cpuid::{cpuid, CpuIdResult};
+                // let cpuid_01 = cpuid!(0x1, 0x0);
+                // debug!("CPUID.01H.ECX: {:#x?}, bit26: {}", cpuid_01.ecx, cpuid_01.ecx.get_bit(26));
+
+                // let cpuid_0d_01 = cpuid!(0xd, 0x1);
+                // debug!("CPUID.0DH(ECX=1).EAX: {:#x?}, bit3: {}", cpuid_0d_01.eax, cpuid_0d_01.eax.get_bit(3));
+
+                Some(Ok(()))
+            },
+            VmxExitReason::CPUID => Some(self.handle_cpuid()),
+            _ => None,
+        }
+    }
+
+    #[cfg(feature = "type1_5")]
+    fn handle_cpuid(&mut self) -> HyperResult {
+        use raw_cpuid::{cpuid, CpuIdResult};
+
+        const VM_EXIT_INSTR_LEN_CPUID: u8 = 2;
+        const LEAF_FEATURE_INFO: u32 = 0x1;
+        const LEAF_HYPERVISOR_INFO: u32 = 0x4000_0000;
+        const LEAF_HYPERVISOR_FEATURE: u32 = 0x4000_0001;
+        const VENDOR_STR: &[u8; 12] = b"RVMRVMRVMRVM";
+
+        const OSXSAVE: u64 = 1 << 27;
+        const VMX: u64 = 1 << 5;
+        const HYPERVISOR:u64 = 1 << 31;
+
+        let signature = unsafe { &*("RVMRVMRVMRVM".as_ptr() as *const [u32; 3]) };
+        let cr4_flags = Cr4Flags::from_bits_truncate(self.cr(4) as u64);
+        let guest_regs = self.regs_mut();
+        let function = guest_regs.rax as u32;
+        if function == LEAF_HYPERVISOR_INFO as _ {
+            guest_regs.rax = LEAF_HYPERVISOR_FEATURE as u32 as _;
+            guest_regs.rbx = signature[0] as _;
+            guest_regs.rcx = signature[1] as _;
+            guest_regs.rdx = signature[2] as _;
+        } else if function == LEAF_HYPERVISOR_FEATURE as _ {
+            guest_regs.rax = 0;
+            guest_regs.rbx = 0;
+            guest_regs.rcx = 0;
+            guest_regs.rdx = 0;
+        } else {
+            let res = cpuid!(guest_regs.rax, guest_regs.rcx);
+            guest_regs.rax = res.eax as _;
+            guest_regs.rbx = res.ebx as _;
+            guest_regs.rcx = res.ecx as _;
+            guest_regs.rdx = res.edx as _;
+            if function == LEAF_FEATURE_INFO as _ {
+                let mut flags = guest_regs.rcx;
+                if cr4_flags.contains(Cr4Flags::OSXSAVE) {
+                    flags |= OSXSAVE;
+                }
+                flags |= !VMX;
+                flags |= HYPERVISOR;
+                guest_regs.rcx = flags;
+            }
+        }
+        // debug!("cpuid return guest_regs:{:#x?}", guest_regs);
+        self.advance_rip(VM_EXIT_INSTR_LEN_CPUID)?;
+        Ok(())
+    }
+
+    #[cfg(not(feature = "type1_5"))]
+    fn handle_cpuid(&mut self) -> HyperResult {
+        use raw_cpuid::{cpuid, CpuIdResult};
+
+        const VM_EXIT_INSTR_LEN_CPUID: u8 = 2;
+        const LEAF_FEATURE_INFO: u32 = 0x1;
+        const LEAF_STRUCTURED_EXTENDED_FEATURE_FLAGS_ENUMERATION: u32 = 0x7;
+        const LEAF_PROCESSOR_EXTENDED_STATE_ENUMERATION: u32 = 0xd;
+        const LEAF_HYPERVISOR_INFO: u32 = 0x4000_0000;
+        const LEAF_HYPERVISOR_FEATURE: u32 = 0x4000_0001;
+        const VENDOR_STR: &[u8; 12] = b"RVMRVMRVMRVM";
+        let vendor_regs = unsafe { &*(VENDOR_STR.as_ptr() as *const [u32; 3]) };
+
+        let regs_clone = self.regs_mut().clone();
+        let function = regs_clone.rax as u32;
+        let res = match function {
+            LEAF_FEATURE_INFO => {
+                const FEATURE_VMX: u32 = 1 << 5;
+                const FEATURE_HYPERVISOR: u32 = 1 << 31;
+                let mut res = cpuid!(regs_clone.rax, regs_clone.rcx);
+                res.ecx &= !FEATURE_VMX;
+                res.ecx |= FEATURE_HYPERVISOR;
+                res
+            },
+            LEAF_STRUCTURED_EXTENDED_FEATURE_FLAGS_ENUMERATION => {
+                let mut res = cpuid!(regs_clone.rax, regs_clone.rcx);
+                if regs_clone.rcx == 0 {
+                    res.ecx.set_bit(0x5, false); // clear waitpkg
+                }
+
+                res
+            },
+            LEAF_PROCESSOR_EXTENDED_STATE_ENUMERATION => {
+                self.load_guest_xstate();
+                let res = cpuid!(regs_clone.rax, regs_clone.rcx);
+                self.load_host_xstate();
+
+                res
+            }
+            LEAF_HYPERVISOR_INFO => CpuIdResult {
+                eax: LEAF_HYPERVISOR_FEATURE,
+                ebx: vendor_regs[0],
+                ecx: vendor_regs[1],
+                edx: vendor_regs[2],
+            },
+            LEAF_HYPERVISOR_FEATURE => CpuIdResult {
+                eax: 0,
+                ebx: 0,
+                ecx: 0,
+                edx: 0,
+            },
+            _ => cpuid!(regs_clone.rax, regs_clone.rcx),
         };
 
-        if result.is_err() {
-            panic!(
-                "Failed to handle VM-exit {:?}, error {:?}:\n{:#x?}",
-                exit_info.exit_reason, result.err().unwrap(), self
-            );
-        }
+        trace!(
+            "VM exit: CPUID({:#x}, {:#x}): {:?}",
+            regs_clone.rax, regs_clone.rcx, res
+        );
+        
+        let regs = self.regs_mut();
+        regs.rax = res.eax as _;
+        regs.rbx = res.ebx as _;
+        regs.rcx = res.ecx as _;
+        regs.rdx = res.edx as _;
+        self.advance_rip(VM_EXIT_INSTR_LEN_CPUID)?;
 
-        // Check if there is an APIC timer interrupt
-        if self.apic_timer.check_interrupt() {
-            self.inject_event(self.apic_timer.vector(), None);
+        Ok(())
+    }
+
+    fn handle_xsetbv(&mut self) -> HyperResult {
+        const XCR_XCR0: u64 = 0;
+        const VM_EXIT_INSTR_LEN_XSETBV: u8 = 3;
+
+        let index = self.guest_regs.rcx.get_bits(0..32);
+        let value = self.guest_regs.rdx.get_bits(0..32) << 32 | self.guest_regs.rax.get_bits(0..32);
+
+        // TODO: get host-supported xcr0 mask by cpuid and reject any guest-xsetbv violating that
+        if index == XCR_XCR0 {
+            Xcr0::from_bits(value).and_then(|x| {
+                if !x.contains(Xcr0::XCR0_FPU_MMX_STATE) {
+                    return None;
+                } 
+        
+                if x.contains(Xcr0::XCR0_AVX_STATE) && !x.contains(Xcr0::XCR0_SSE_STATE) {
+                    return None;
+                }
+
+                if x.contains(Xcr0::XCR0_BNDCSR_STATE) ^ x.contains(Xcr0::XCR0_BNDREG_STATE) {
+                    return None;
+                }
+
+                if x.contains(Xcr0::XCR0_OPMASK_STATE) || x.contains(Xcr0::XCR0_ZMM_HI256_STATE) || x.contains(Xcr0::XCR0_HI16_ZMM_STATE) {
+                    if !x.contains(Xcr0::XCR0_AVX_STATE) || !x.contains(Xcr0::XCR0_OPMASK_STATE) || !x.contains(Xcr0::XCR0_ZMM_HI256_STATE) || !x.contains(Xcr0::XCR0_HI16_ZMM_STATE) {
+                        return None;
+                    }
+                }
+
+                Some(x)
+            })
+            .ok_or(HyperError::InvalidParam)
+            .and_then(|x| {
+                self.xstate.guest_xcr0 = x.bits();
+                self.advance_rip(VM_EXIT_INSTR_LEN_XSETBV)
+            })
+        } else {
+            // xcr0 only
+            Err(crate::HyperError::NotSupported)
         }
-        self.check_pending_events().unwrap();
+    }
+
+    fn load_guest_xstate(&mut self) {
+        unsafe {
+            xcr0_write(Xcr0::from_bits_unchecked(self.xstate.guest_xcr0));
+            Msr::IA32_XSS.write(self.xstate.guest_xss);
+        }
+    }
+
+    fn load_host_xstate(&mut self) {
+        unsafe {
+            xcr0_write(Xcr0::from_bits_unchecked(self.xstate.host_xcr0));
+            Msr::IA32_XSS.write(self.xstate.host_xss);
+        }
     }
 }
 

@@ -51,11 +51,15 @@ pub use arch::{
 };
 
 pub use hal::HyperCraftHal;
+#[cfg(target_arch = "x86_64")]
+pub use hal::{PerCpuDevices, PerVmDevices};
 pub use memory::{
     GuestPageNum, GuestPageTableTrait, GuestPhysAddr, GuestVirtAddr, HostPageNum, HostPhysAddr,
     HostVirtAddr,
 };
 pub use vcpus::VmCpus;
+#[cfg(all(target_arch = "x86_64", feature = "type1_5"))]
+pub use arch::LinuxContext;
 
 #[cfg(target_arch = "aarch64")]
 pub use arch::lower_aarch64_synchronous;

@@ -9,7 +9,12 @@ use x86::msr::{rdmsr, wrmsr};
 pub enum Msr {
     IA32_FEATURE_CONTROL = 0x3a,
 
+    IA32_SYSENTER_CS = 0x174,
+    IA32_SYSENTER_ESP = 0x175,
+    IA32_SYSENTER_EIP = 0x176,
+    
     IA32_PAT = 0x277,
+    IA32_MTRR_DEF_TYPE = 0x2ff,
 
     IA32_VMX_BASIC = 0x480,
     IA32_VMX_PINBASED_CTLS = 0x481,
@@ -27,6 +32,8 @@ pub enum Msr {
     IA32_VMX_TRUE_PROCBASED_CTLS = 0x48e,
     IA32_VMX_TRUE_EXIT_CTLS = 0x48f,
     IA32_VMX_TRUE_ENTRY_CTLS = 0x490,
+
+    IA32_XSS = 0xda0,
 
     IA32_EFER = 0xc000_0080,
     IA32_STAR = 0xc000_0081,

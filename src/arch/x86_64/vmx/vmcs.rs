@@ -484,7 +484,7 @@ pub struct VmxExitInfo {
     /// VM-entry failure. (0 = true VM exit; 1 = VM-entry failure)
     pub entry_failure: bool,
     /// Basic exit reason.
-pub exit_reason: VmxExitReason,
+    pub exit_reason: VmxExitReason,
     /// For VM exits resulting from instruction execution, this field receives
     /// the length in bytes of the instruction whose execution led to the VM exit.
     pub exit_instruction_length: u32,
@@ -541,9 +541,29 @@ pub struct VmxIoExitInfo {
     pub port: u16,
 }
 
+/// Exit Qualification for Control Register Accesses. (SDM Vol. 3C, Section 28.2.1, Table 28-5)
+#[derive(Debug)]
+pub struct CrAccessInfo {
+    /// Number of control register accessed.
+    pub cr_number: u8,
+    ///
+    pub access_type: u8,
+}
+
 pub mod controls {
     pub use x86::vmx::vmcs::control::{EntryControls, ExitControls};
     pub use x86::vmx::vmcs::control::{PinbasedControls, PrimaryControls, SecondaryControls};
+}
+#[cfg(feature = "type1_5")]
+pub fn set_control_type15(
+    field: VmcsControl32,
+    old_msr: u64,
+    set: u32,
+    clear: u32,
+) -> HyperResult<()> {
+    assert_eq!((set & clear), 0);
+    field.write((old_msr as u32) & !clear | set)?;
+    Ok(())
 }
 
 pub fn set_control(
@@ -701,6 +721,13 @@ pub fn ept_violation_info() -> HyperResult<NestedPageFaultInfo> {
     })
 }
 
+pub fn cr_access_info() -> HyperResult<CrAccessInfo> {
+    let qualification = VmcsReadOnlyNW::EXIT_QUALIFICATION.read()?;
+    Ok(CrAccessInfo {
+        cr_number: qualification.get_bits(0..4) as u8,
+        access_type: qualification.get_bits(4..6) as u8, 
+    })
+}
 
 /// Helper used to extract VMX-specific Result in accordance with
 /// conventions described in Intel SDM, Volume 3C, Section 30.2.
