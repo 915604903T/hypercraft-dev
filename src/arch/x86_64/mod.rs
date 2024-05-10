@@ -139,10 +139,18 @@ impl<H: HyperCraftHal, PD: PerCpuDevices<H>, VD: PerVmDevices<H>, G: GuestPageTa
                             }
                         }
                         None => {
-                            panic!(
-                                "nobody wants to handle this vm-exit: {:?}, vcpu: {:#x?}",
-                                exit_info, vcpu
-                            );
+                            if exit_info.exit_reason == VmxExitReason::IO_INSTRUCTION {
+                                let io_info = vcpu.io_exit_info().unwrap();
+                                panic!(
+                                    "nobody wants to handle this vm-exit: {:?}, io-info: {:?}",
+                                    exit_info, io_info
+                                );
+                            } else {
+                                panic!(
+                                    "nobody wants to handle this vm-exit: {:?}, vcpu: {:#x?}",
+                                    exit_info, vcpu
+                                );
+                            }
                         }
                     }
                 }
@@ -209,7 +217,8 @@ impl<H: HyperCraftHal, PD: PerCpuDevices<H>, VD: PerVmDevices<H>, G: GuestPageTa
                 // debug!("test decode instruction");
                 // let guest_rip = exit_info.guest_rip;
                 // let length = exit_info.exit_instruction_length;
-                // let _instr = Self::decode_instr(self.ept.clone(), vcpu, guest_rip, length)?;
+                // let instr = Self::decode_instr(self.ept.clone(), vcpu, guest_rip, length)?;
+                // debug!("this is instr {:?}", instr);
             }
             // vcpu_device.check_events(vcpu)?;
         }
@@ -257,7 +266,7 @@ impl<H: HyperCraftHal, PD: PerCpuDevices<H>, VD: PerVmDevices<H>, G: GuestPageTa
         let mut output = String::new();
         let mut formatter = MasmFormatter::new();
         formatter.format(&instr, &mut output);
-        debug!("Instruction: {}", output);
+        // debug!("Instruction: {}", output);
         Ok(instr)
     }
 
@@ -286,7 +295,7 @@ impl<H: HyperCraftHal, PD: PerCpuDevices<H>, VD: PerVmDevices<H>, G: GuestPageTa
                 content.push(value_ptr.read());
             }
         }
-        debug!("get_gva_content_bytes: content: {:?}", content);
+        // debug!("get_gva_content_bytes: content: {:?}", content);
         Ok(content)
     }
 
